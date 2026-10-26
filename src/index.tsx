@@ -2,7 +2,11 @@
 
 import {
   ButtonItem,
+  DialogButton,
   DropdownItem,
+  Field,
+  Focusable,
+  Navigation,
   PanelSection,
   PanelSectionRow,
   TextField,
@@ -15,7 +19,7 @@ import { FaExchangeAlt } from "react-icons/fa";
 
 type Peer = { id: string; name: string; kind: string; ip: string };
 type Item = { id: number; dir: "in" | "out"; peer: string; time: number; preview: string; length: number };
-type Settings = { auto_copy: boolean; auto_send: boolean; notify: boolean; manual: string; pair_code: string; target: string };
+type Settings = { enabled: boolean; auto_copy: boolean; auto_send: boolean; notify: boolean; manual: string; pair_code: string; target: string };
 type State = {
   me: { name: string; ips: string[]; port: number };
   peers: Peer[];
@@ -33,15 +37,41 @@ const getState = callable<[], State>("get_state");
 const sendClipboard = callable<[], Result>("send_clipboard");
 const sendText = callable<[text: string], Result>("send_text");
 const copyItem = callable<[id: number], { ok: boolean; text: string }>("copy_item");
+const itemText = callable<[id: number], string>("item_text");
 const clearHistory = callable<[], void>("clear_history");
 const setSetting = callable<[key: string, value: string | boolean], void>("set_setting");
 const refreshNow = callable<[], void>("refresh");
+const logInfo = callable<[text: string], void>("log_info");
+
+// Writes the clipboard-related functions this Steam build offers to the plugin log (for troubleshooting).
+function logSteamClipboardApis() {
+  try {
+    const sc = (window as any).SteamClient ?? {};
+    const found: string[] = [];
+    for (const area of Object.keys(sc)) {
+      try {
+        for (const name of Object.keys(sc[area] ?? {}))
+          if (/clip|paste|copy/i.test(name)) found.push(`${area}.${name}`);
+      } catch { /* some areas can't be listed */ }
+    }
+    logInfo("Steam clipboard functions: " + (found.join(", ") || "none")).catch(() => {});
+  } catch (e) {
+    logInfo("couldn't list Steam functions: " + e).catch(() => {});
+  }
+}
 
 const muted = "#8b929a";
 const MAX_SHOWN = 8;
 
-// Fallback when the backend can't reach the X clipboard: let Steam's browser copy it.
-function browserCopy(text: string, doc: Document = document): boolean {
+// Also copies through Steam's browser, so Steam's own paste has the text even if the X clipboard handoff fails.
+async function browserCopy(text: string, doc: Document = document): Promise<boolean> {
+  try {
+    const nav = doc.defaultView?.navigator;
+    if (nav?.clipboard?.writeText) {
+      await nav.clipboard.writeText(text);
+      return true;
+    }
+  } catch { /* not allowed here; try the older way */ }
   const el = doc.createElement("textarea");
   el.value = text;
   el.style.position = "fixed";
@@ -53,6 +83,41 @@ function browserCopy(text: string, doc: Document = document): boolean {
   try { ok = doc.execCommand("copy"); } catch { ok = false; }
   el.remove();
   return ok;
+}
+
+// Type / Paste: ClipLink enters text itself through Steam's virtual keyboard, after closing the menu so the game
+// or app underneath has focus again. Type doesn't depend on the clipboard at all.
+declare const SteamClient: any;
+const KEY_V = 25, KEY_RETURN = 40, KEY_LCONTROL = 103;
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function canEnterText() {
+  return typeof SteamClient !== "undefined" && !!SteamClient.Input?.ControllerKeyboardSendText;
+}
+
+function pressKey(key: number) {
+  SteamClient.Input.ControllerKeyboardSetKeyState(key, true);
+  SteamClient.Input.ControllerKeyboardSetKeyState(key, false);
+}
+
+async function backToApp() {
+  Navigation.CloseSideMenus();
+  await sleep(450);
+}
+
+async function typeIntoApp(text: string) {
+  await backToApp();
+  text.replace(/\r\n?/g, "\n").split("\n").forEach((line, i) => {
+    if (i > 0) pressKey(KEY_RETURN);
+    if (line) SteamClient.Input.ControllerKeyboardSendText(line);
+  });
+}
+
+async function pasteIntoApp() {
+  await backToApp();
+  SteamClient.Input.ControllerKeyboardSetKeyState(KEY_LCONTROL, true);
+  pressKey(KEY_V);
+  SteamClient.Input.ControllerKeyboardSetKeyState(KEY_LCONTROL, false);
 }
 
 function formatWhen(epochSeconds: number) {
@@ -149,12 +214,24 @@ function Content() {
 
   const save = async (key: keyof Settings, value: string | boolean) => { await setSetting(key, value); await refresh(); };
 
-  const copy = async (item: Item, doc?: Document) => {
-    const r = await copyItem(item.id);
-    let ok = r.ok;
-    if (!ok && r.text) ok = browserCopy(r.text, doc);
-    setMessage({ text: ok ? "Copied to the clipboard." : "Couldn't reach the clipboard.", error: !ok });
-    refresh();
+  const enterText = async (item: Item, how: "type" | "paste", doc?: Document) => {
+    if (!canEnterText()) {
+      setMessage({ text: "This Steam version doesn't let plugins enter text.", error: true });
+      return;
+    }
+    if (how === "type") {
+      const text = await itemText(item.id);
+      if (text) await typeIntoApp(text);
+      return;
+    }
+    const [r, text] = await Promise.all([copyItem(item.id), itemText(item.id)]);
+    const viaSteam = text ? await browserCopy(text, doc) : false;
+    logInfo(`Paste: backend copy ${r.ok ? "ok" : "failed"}, Steam browser copy ${viaSteam ? "ok" : "not allowed"}`).catch(() => {});
+    if (!r.ok && !viaSteam) {
+      setMessage({ text: "Couldn't reach the clipboard. Try Type instead.", error: true });
+      return;
+    }
+    await pasteIntoApp();
   };
 
   if (!s) {
@@ -172,8 +249,25 @@ function Content() {
   const status = message ?? (s.status ? { text: s.status, error: s.error } : null);
   const targetOptions = [{ data: "", label: "All devices" }, ...s.peers.map((p) => ({ data: p.id, label: p.name }))];
 
+  const power = (
+    <PanelSection>
+      <PanelSectionRow>
+        <ToggleField
+          label="ClipLink"
+          description={s.settings.enabled
+            ? "Sharing text with your PC"
+            : "Off: not on the network and not watching the clipboard"}
+          checked={s.settings.enabled}
+          onChange={(on) => { setMessage(null); save("enabled", on); }}
+        />
+      </PanelSectionRow>
+    </PanelSection>
+  );
+  if (!s.settings.enabled) return power;
+
   return (
     <>
+      {power}
       <PanelSection title="Devices">
         {s.peers.length > 0
           ? <PeerList peers={s.peers} />
@@ -213,17 +307,26 @@ function Content() {
       </PanelSection>
 
       <PanelSection title="Recent">
-        {shown.length === 0 && <Note text="Text you send or receive shows up here. Select an entry to copy it again." />}
+        {shown.length === 0
+          ? <Note text="Text you send or receive shows up here." />
+          : <Note text="Type enters the text into the game or app you were using; Paste puts it on the clipboard and presses Ctrl+V there." />}
         {shown.map((item) => (
           <PanelSectionRow key={item.id}>
-            <ButtonItem
-              layout="below"
-              label={item.preview}
+            <Field
+              label={<span style={{ wordBreak: "break-word" }}>{item.preview}</span>}
               description={`${item.dir === "in" ? "From" : "To"} ${item.peer} · ${formatWhen(item.time)}${item.length > 120 ? ` · ${item.length.toLocaleString()} characters` : ""}`}
-              onClick={(e: any) => copy(item, e?.currentTarget?.ownerDocument)}
+              childrenLayout="below"
             >
-              Copy
-            </ButtonItem>
+              <Focusable style={{ display: "flex", gap: "8px" }} flow-children="horizontal">
+                <DialogButton style={{ flex: 1, minWidth: 0 }} onClick={() => enterText(item, "type")}>Type</DialogButton>
+                <DialogButton
+                  style={{ flex: 1, minWidth: 0 }}
+                  onClick={(e: any) => enterText(item, "paste", e?.currentTarget?.ownerDocument)}
+                >
+                  Paste
+                </DialogButton>
+              </Focusable>
+            </Field>
           </PanelSectionRow>
         ))}
         {shown.length > 0 && (
@@ -278,10 +381,15 @@ function Content() {
 }
 
 export default definePlugin(() => {
+  logSteamClipboardApis();
   // Registered for the plugin's lifetime so text arriving while the menu is closed still shows a notification.
-  const onReceived = addEventListener<[Received]>("cliplink_received", (r) => {
+  const onReceived = addEventListener<[Received]>("cliplink_received", async (r) => {
     let copied = r.copied;
-    if (!copied && r.text) copied = browserCopy(r.text);
+    if (r.text) {
+      const viaSteam = await browserCopy(r.text);
+      logInfo(`text arrived: backend copy ${r.copied ? "ok" : "failed"}, Steam browser copy ${viaSteam ? "ok" : "not allowed"}`).catch(() => {});
+      copied = copied || viaSteam;
+    }
     if (!r.notify) return;
     toaster.toast({
       title: copied ? `Copied text from ${r.from}` : `Text from ${r.from}`,

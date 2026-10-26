@@ -26,13 +26,13 @@ PROTOCOL = 1
 TCP_PORT = int(os.environ.get("CLIPLINK_TCP_PORT", "47390"))       # overridable for tests on one machine
 UDP_PORT = int(os.environ.get("CLIPLINK_UDP_PORT", "47391"))
 BIND = os.environ.get("CLIPLINK_BIND", "0.0.0.0")                 # 127.0.0.1 for tests
-DISCOVERY_PORT = 47391           # where hellos are sent; peers answer the address they came from
+DISCOVERY_PORT = int(os.environ.get("CLIPLINK_DISCOVERY_PORT", "47391"))   # where hellos go; peers answer the sender
 HELLO_EVERY = 10                 # seconds between discovery broadcasts
 PEER_TIMEOUT = 35                # a device that hasn't said hello for this long is gone
 MAX_CHARS = 1000000              # longest text sent or accepted
 MAX_LINE = 16 * 1024 * 1024
 HISTORY = 20
-DEFAULTS = {"id": "", "auto_copy": True, "auto_send": False, "notify": True, "manual": "", "pair_code": "", "target": ""}
+DEFAULTS = {"id": "", "enabled": True, "auto_copy": True, "auto_send": False, "notify": True, "manual": "", "pair_code": "", "target": ""}
 
 
 def system_env():
@@ -164,7 +164,7 @@ def _on_x_error(dpy, event):
 def _on_io_error(dpy):
     d = _LIVE_DISPLAYS.get(dpy)
     if d is not None:
-        d.dead = True
+        d.dead = d.broken = True
     if XLIB is not None and XLIB.has_exit_handler:
         return 0             # our exit handler below runs next and returns instead of exiting
     # Old libX11 calls exit() when this handler returns, so park the display's thread instead.
@@ -196,6 +196,7 @@ class Xlib:
             "XGetWindowProperty": ([p, Window, Atom, l, l, i, Atom, ctypes.POINTER(Atom), ctypes.POINTER(i),
                                     ctypes.POINTER(ul), ctypes.POINTER(ul), ctypes.POINTER(p)], i),
             "XDeleteProperty": ([p, Window, Atom], i), "XFree": ([p], i), "XFlush": ([p], i),
+            "XGetAtomName": ([p, Atom], p),
             "XConnectionNumber": ([p], i), "XMaxRequestSize": ([p], l), "XExtendedMaxRequestSize": ([p], l),
             "XSetErrorHandler": ([ERROR_HANDLER], p), "XSetIOErrorHandler": ([IO_ERROR_HANDLER], p),
         }
@@ -238,6 +239,7 @@ class XDisplay(threading.Thread):
         X = XLIB.x
         self.display_name, self.dpy, self.on_change = name, dpy, on_change
         self.dead = False
+        self.broken = False         # the connection failed (vs. stop()); it must not be touched again
         self.text = None            # UTF-8 bytes we serve while we own CLIPBOARD
         self.changed = 0.0          # monotonic time someone else last took CLIPBOARD
         self.pending_change = False
@@ -253,6 +255,7 @@ class XDisplay(threading.Thread):
         self.UTF8, self.INCR = atom("UTF8_STRING"), atom("INCR")
         self.DATA, self.CLOCK = atom("CLIPLINK_DATA"), atom("CLIPLINK_CLOCK")
         self.targets = {atom(n): n for n in self.TEXT_TARGETS}
+        self.atom_names = {}
         self.fixes_event = None
         if XLIB.fixes is not None:
             base, err = ctypes.c_int(), ctypes.c_int()
@@ -311,6 +314,7 @@ class XDisplay(threading.Thread):
             if self.pending_change and not self.dead:
                 self.pending_change = False
                 text = self._read()
+                self._log("new clipboard content: %s", "%d characters" % len(text) if text else "no text")
                 if text:
                     self.on_change(self, text)
             self._drain()
@@ -325,12 +329,27 @@ class XDisplay(threading.Thread):
         self.dead = True
         while self.jobs:                 # release anyone still waiting
             self.jobs.popleft()()
+        if not self.broken:
+            X.XCloseDisplay(self.dpy)
         _LIVE_DISPLAYS.pop(self.dpy, None)
         for f in (self.wake_r, self.wake_w):
             try:
                 os.close(f)
             except OSError:
                 pass
+
+    def _log(self, fmt, *args):
+        decky.logger.info("x11 %s: " + fmt, self.display_name, *args)
+
+    def _atom_name(self, a):
+        if a not in self.atom_names:
+            ptr = XLIB.x.XGetAtomName(self.dpy, a) if a else None
+            if ptr:
+                self.atom_names[a] = ctypes.string_at(ptr).decode("utf-8", "replace")
+                XLIB.x.XFree(ptr)
+            else:
+                self.atom_names[a] = str(a)
+        return self.atom_names[a]
 
     def _drain(self):
         X = XLIB.x
@@ -366,10 +385,12 @@ class XDisplay(threading.Thread):
             self._answer(ev.request)
         elif ev.type == SELECTION_CLEAR:
             if ev.clear.selection == self.CLIPBOARD:
+                self._log("another window took the clipboard from us")
                 self.text = None
         elif self.fixes_event is not None and ev.type == self.fixes_event:
             f = ev.fixes
             if f.selection == self.CLIPBOARD and f.owner not in (0, self.win):
+                self._log("clipboard now owned by window 0x%x", f.owner)
                 self.changed = time.monotonic()
                 self.pending_change = True
 
@@ -387,9 +408,12 @@ class XDisplay(threading.Thread):
         self.text = data
         X.XSetSelectionOwner(self.dpy, self.CLIPBOARD, self.win, stamp)
         X.XFlush(self.dpy)
-        if X.XGetSelectionOwner(self.dpy, self.CLIPBOARD) != self.win:
+        owner = X.XGetSelectionOwner(self.dpy, self.CLIPBOARD)
+        if owner != self.win:
+            self._log("couldn't take the clipboard (owner is 0x%x)", owner)
             self.text = None
             return False
+        self._log("took the clipboard: %d bytes, our window 0x%x, time %d", len(data), self.win, stamp)
         self.own_time = stamp
         return True
 
@@ -424,6 +448,9 @@ class XDisplay(threading.Thread):
         s.property = prop if ok else 0
         X.XSendEvent(self.dpy, req.requestor, 0, 0, ctypes.byref(reply))
         X.XFlush(self.dpy)
+        self._log("window 0x%x asked for %s (%s) -> %s", req.requestor, self._atom_name(req.target),
+                  self._atom_name(req.selection), "answered" if ok else
+                  ("refused: we don't own it" if self.text is None else "refused: unsupported format"))
 
     def _get_property(self, prop, delete=True):
         X = XLIB.x
@@ -544,15 +571,22 @@ class Clipboard:
             env_auth = _proc_environ_displays()
             home = os.path.expanduser("~")
             extra = [os.path.join(home, ".Xauthority")] + glob.glob("/run/user/%d/xauth_*" % os.getuid())
+            if any(d not in self.failed for d in todo):         # not again on every retry of a failing display
+                decky.logger.info("clipboard: X sockets %s; displays used by our processes %s; running as uid %d",
+                                  sockets, env_auth, os.getuid())
             for name in todo:
-                dpy = self._open(name, env_auth.get(name, []) + extra)
+                dpy, auth = self._open(name, env_auth.get(name, []) + extra)
                 if not dpy:
+                    if name not in self.failed:
+                        decky.logger.warning("clipboard: can't open display %s", name)
                     self.failed[name] = time.monotonic()
                     continue
+                self.failed.pop(name, None)
                 d = XDisplay(name, dpy, self._changed)
                 d.start()
                 self.displays[name] = d
-                decky.logger.info("clipboard: opened display %s", name)
+                decky.logger.info("clipboard: opened display %s (%s, XFixes %s)", name,
+                                  "auth " + auth if auth else "no auth file", "yes" if d.fixes_event is not None else "no")
 
     @staticmethod
     def _open(name, auths):
@@ -565,8 +599,8 @@ class Clipboard:
                     os.environ["XAUTHORITY"] = a
                 dpy = XLIB.x.XOpenDisplay(name.encode())
                 if dpy:
-                    return dpy
-            return None
+                    return dpy, a
+            return None, None
         finally:
             if old is None:
                 os.environ.pop("XAUTHORITY", None)
@@ -582,7 +616,10 @@ class Clipboard:
     def set_text(self, text):
         self.refresh()
         ok = False
-        for d in self.live():
+        live = self.live()
+        if not live:
+            decky.logger.warning("clipboard: no X display to copy to")
+        for d in live:
             ok = d.set_text(text) or ok
         if self.in_desktop():
             ok = self._klipper_set(text) or ok
@@ -686,8 +723,24 @@ class Plugin:
         self.ips, self.broadcasts = interface_addresses()
         self.udp, self.server, self.tasks = None, None, []
         self.clipboard = Clipboard(self._clipboard_changed_threadsafe)
-        await self.loop.run_in_executor(None, self.clipboard.refresh)
+        if self.settings["enabled"]:
+            await self._start()
+        decky.logger.info("ClipLink backend started as %s (%s)%s", self.name, ", ".join(self.ips) or "no network",
+                          "" if self.settings["enabled"] else "; sharing is off")
 
+    async def _unload(self):
+        if getattr(self, "clipboard", None) is not None:
+            await self._stop()
+
+    async def _uninstall(self):
+        pass
+
+    # ---------- on / off
+
+    async def _start(self):
+        """Listens on the network and watches the clipboard."""
+        self._set_status("")
+        await self.loop.run_in_executor(None, self.clipboard.refresh)
         try:
             self.server = await asyncio.start_server(self._handle_tcp, BIND, TCP_PORT, limit=MAX_LINE)
         except OSError as e:
@@ -701,21 +754,22 @@ class Plugin:
         except OSError as e:
             decky.logger.warning("discovery unavailable: %s", e)
         self.tasks = [self.loop.create_task(self._discovery_loop()), self.loop.create_task(self._housekeeping())]
-        decky.logger.info("ClipLink backend started as %s (%s)", self.name, ", ".join(self.ips) or "no network")
 
-    async def _unload(self):
-        for t in getattr(self, "tasks", []):
+    async def _stop(self):
+        """Says goodbye, closes the ports and lets go of the clipboard."""
+        for t in self.tasks:
             t.cancel()
-        if getattr(self, "udp", None) is not None:
+        self.tasks = []
+        if self.udp is not None:
             self._hello("bye")
             self.udp.close()
-        if getattr(self, "server", None) is not None:
+            self.udp = None
+        if self.server is not None:
             self.server.close()
-        if getattr(self, "clipboard", None) is not None:
-            self.clipboard.stop()
-
-    async def _uninstall(self):
-        pass
+            self.server = None
+        self.clipboard.stop()
+        self.peers.clear()
+        self._set_status("")
 
     # ---------- state
 
@@ -828,7 +882,7 @@ class Plugin:
         asyncio.run_coroutine_threadsafe(self._clipboard_changed(text), self.loop)
 
     async def _clipboard_changed(self, text):
-        if not self.settings["auto_send"] or not text.strip() or text in self.known:
+        if not self.settings["enabled"] or not self.settings["auto_send"] or not text.strip() or text in self.known:
             return
         self._remember(text)
         await self._send(text, auto=True)
@@ -871,6 +925,8 @@ class Plugin:
             writer.close()
 
     async def _send(self, text, auto=False):
+        if not self.settings["enabled"]:
+            return {"ok": False, "message": "ClipLink is turned off."}
         if not text:
             return {"ok": False, "message": "Nothing to send."}
         if len(text) > MAX_CHARS:
@@ -939,8 +995,8 @@ class Plugin:
         self._set_status(("Copied text from " if copied else "Received text from ") + peer["name"])
         event = {"id": item["id"], "from": peer["name"], "copied": copied, "preview": preview(text, 80),
                  "notify": self.settings["notify"], "autoCopy": self.settings["auto_copy"]}
-        if self.settings["auto_copy"] and not copied and len(text) <= 100000:
-            event["text"] = text            # lets the frontend try to copy it instead
+        if self.settings["auto_copy"] and len(text) <= 100000:
+            event["text"] = text            # the frontend also copies it through Steam's browser
         try:
             await decky.emit("cliplink_received", event)
         except Exception as e:
@@ -964,6 +1020,8 @@ class Plugin:
         }
 
     async def send_clipboard(self):
+        if not self.settings["enabled"]:
+            return {"ok": False, "message": "ClipLink is turned off."}
         text = await self.loop.run_in_executor(None, self.clipboard.get_text)
         if not text:
             msg = "The clipboard is empty." if self.clipboard.available() else self.clipboard.describe()
@@ -983,6 +1041,13 @@ class Plugin:
         self._set_status("Copied to the clipboard." if ok else "Couldn't reach the clipboard.", not ok)
         return {"ok": ok, "text": "" if ok else item["text"]}
 
+    async def item_text(self, item_id):
+        item = next((h for h in self.history if h["id"] == item_id), None)
+        return item["text"] if item is not None else ""
+
+    async def log_info(self, text):
+        decky.logger.info("frontend: %s", str(text)[:4000])
+
     async def clear_history(self):
         self.history.clear()
         self._set_status("")
@@ -994,12 +1059,21 @@ class Plugin:
             value = bool(value)
         else:
             value = str(value or "").strip()[:200]
+        old = self.settings[key]
         self.settings[key] = value
         self._save_settings()
+        if key == "enabled" and value != old:
+            if value:
+                await self._start()
+            else:
+                await self._stop()
+            decky.logger.info("sharing turned %s", "on" if value else "off")
         if key == "manual" and value:
             self._hello(reply=True)
 
     async def refresh(self):
+        if not self.settings["enabled"]:
+            return
         self.ips, self.broadcasts = await self.loop.run_in_executor(None, interface_addresses)
         self._hello(reply=True)
         await self.loop.run_in_executor(None, self.clipboard.refresh)
