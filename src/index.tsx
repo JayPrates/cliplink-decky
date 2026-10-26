@@ -245,6 +245,15 @@ function Content() {
 
   const save = async (key: keyof Settings, value: string | boolean) => { await setSetting(key, value); await refresh(); };
 
+  // Same two routes as text arriving: the backend's X clipboard and Steam's browser.
+  const copy = async (item: Item, doc?: Document) => {
+    const [r, text] = await Promise.all([copyItem(item.id), itemText(item.id)]);
+    const viaSteam = text ? await browserCopy(text, doc) : false;
+    const ok = r.ok || viaSteam;
+    setMessage({ text: ok ? "Copied to the clipboard." : "Couldn't reach the clipboard.", error: !ok });
+    refresh();
+  };
+
   const enterText = async (item: Item, how: "type" | "paste", doc?: Document) => {
     if (!canEnterText()) {
       setMessage({ text: "This Steam version doesn't let plugins enter text.", error: true });
@@ -348,7 +357,7 @@ function Content() {
       <PanelSection title="Recent">
         {shown.length === 0
           ? <Note text="Text you send or receive shows up here." />
-          : <Note text="Type enters the text into the game or app you were using; Paste puts it on the clipboard and presses Ctrl+V there." />}
+          : <Note text="Copy puts the text on the clipboard. Type types it and Paste presses Ctrl+V with it, in the game or app you were using." />}
         {shown.map((item) => (
           <PanelSectionRow key={item.id}>
             <Field
@@ -357,7 +366,9 @@ function Content() {
               childrenLayout="below"
             >
               <Focusable style={{ display: "flex", gap: "8px" }} flow-children="horizontal">
-                <DialogButton style={{ flex: 1, minWidth: 0 }} onClick={() => enterText(item, "type")}>Type</DialogButton>
+                {item.dir === "in"
+                  ? <DialogButton style={{ flex: 1, minWidth: 0 }} onClick={(e: any) => copy(item, e?.currentTarget?.ownerDocument)}>Copy</DialogButton>
+                  : <DialogButton style={{ flex: 1, minWidth: 0 }} onClick={() => enterText(item, "type")}>Type</DialogButton>}
                 <DialogButton
                   style={{ flex: 1, minWidth: 0 }}
                   onClick={(e: any) => enterText(item, "paste", e?.currentTarget?.ownerDocument)}

@@ -7,9 +7,9 @@ for Windows.
   a notification.
 - **Deck → PC:** Quick Access → ClipLink → **Send clipboard**, or type something and press **Send text**. You can
   also turn on **Send what I copy** so everything you copy on the Deck reaches the PC automatically.
-- **Recent:** the last few texts, in both directions. **Type** closes the menu and types the text into the game or
-  app you were using, without going through the clipboard. **Paste** puts it on the clipboard and presses Ctrl+V
-  there.
+- **Recent:** the last few texts, in both directions. Received texts have **Copy**, which puts the text on the
+  clipboard. Sent texts have **Type**, which types the text into the game or app you were using. Every entry has
+  **Paste**, which copies the text and presses Ctrl+V in the game or app you were using.
 - **On/off switch** at the top. When it's off, ClipLink leaves the network and stops watching the clipboard.
 
 Both devices need to be on the same network. They find each other by themselves. If they don't (for example on a
