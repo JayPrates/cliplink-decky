@@ -1,0 +1,11 @@
+{
+  "name": "ClipLink",
+  "author": "JayPrates",
+  "flags": [],
+  "api_version": 1,
+  "publish": {
+    "tags": ["clipboard", "network", "utility"],
+    "description": "Copy text between your Steam Deck and your Windows PC over the local network.",
+    "image": "https://opengraph.githubassets.com/1/SteamDeckHomebrew/PluginLoader"
+  }
+}
