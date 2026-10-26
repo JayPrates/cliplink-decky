@@ -85,14 +85,40 @@ async function browserCopy(text: string, doc: Document = document): Promise<bool
   return ok;
 }
 
-// Type / Paste: ClipLink enters text itself through Steam's virtual keyboard, after closing the menu so the game
-// or app underneath has focus again. Type doesn't depend on the clipboard at all.
+// Type / Paste: ClipLink presses keys through Steam's virtual keyboard, after closing the menu so the game or app
+// underneath has focus again. Type doesn't depend on the clipboard at all.
 declare const SteamClient: any;
-const KEY_V = 25, KEY_RETURN = 40, KEY_LCONTROL = 103;
+const KEY_V = 25, KEY_LSHIFT = 101, KEY_LCONTROL = 103;
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// Type presses real keys (HID usage codes, US layout) because Steam's ControllerKeyboardSendText typed the wrong
+// text on a real Deck. Each entry: character -> [key, needs Shift].
+const KEYMAP: Record<string, [number, boolean]> = (() => {
+  const map: Record<string, [number, boolean]> = {};
+  for (let i = 0; i < 26; i++) {
+    map[String.fromCharCode(97 + i)] = [4 + i, false];
+    map[String.fromCharCode(65 + i)] = [4 + i, true];
+  }
+  "1234567890".split("").forEach((c, i) => { map[c] = [30 + i, false]; });
+  "!@#$%^&*()".split("").forEach((c, i) => { map[c] = [30 + i, true]; });
+  const rest: [string, string, number][] = [
+    ["-", "_", 45], ["=", "+", 46], ["[", "{", 47], ["]", "}", 48], ["\\", "|", 49],
+    [";", ":", 51], ["'", "\"", 52], ["`", "~", 53], [",", "<", 54], [".", ">", 55], ["/", "?", 56],
+  ];
+  for (const [plain, shifted, key] of rest) { map[plain] = [key, false]; map[shifted] = [key, true]; }
+  map["\n"] = [40, false];
+  map["\t"] = [43, false];
+  map[" "] = [44, false];
+  return map;
+})();
+
 function canEnterText() {
-  return typeof SteamClient !== "undefined" && !!SteamClient.Input?.ControllerKeyboardSendText;
+  return typeof SteamClient !== "undefined" && !!SteamClient.Input?.ControllerKeyboardSetKeyState;
+}
+
+// Characters Type can't press (accents, emoji…); those need Paste.
+function untypeable(text: string) {
+  return Array.from(text.replace(/\r\n?/g, "\n")).filter((c) => !KEYMAP[c]).length;
 }
 
 function pressKey(key: number) {
@@ -107,10 +133,15 @@ async function backToApp() {
 
 async function typeIntoApp(text: string) {
   await backToApp();
-  text.replace(/\r\n?/g, "\n").split("\n").forEach((line, i) => {
-    if (i > 0) pressKey(KEY_RETURN);
-    if (line) SteamClient.Input.ControllerKeyboardSendText(line);
-  });
+  const input = SteamClient.Input;
+  for (const c of Array.from(text.replace(/\r\n?/g, "\n"))) {
+    const k = KEYMAP[c];
+    if (!k) continue;
+    if (k[1]) input.ControllerKeyboardSetKeyState(KEY_LSHIFT, true);
+    pressKey(k[0]);
+    if (k[1]) input.ControllerKeyboardSetKeyState(KEY_LSHIFT, false);
+    await sleep(15);        // games read input once per frame; back-to-back presses can get lost
+  }
 }
 
 async function pasteIntoApp() {
@@ -221,7 +252,15 @@ function Content() {
     }
     if (how === "type") {
       const text = await itemText(item.id);
-      if (text) await typeIntoApp(text);
+      if (!text) return;
+      const skipped = untypeable(text);
+      if (skipped === Array.from(text).length) {
+        setMessage({ text: "None of these characters can be typed. Use Paste instead.", error: true });
+        return;
+      }
+      if (skipped > 0)
+        toaster.toast({ title: "ClipLink", body: `Skipped ${skipped} character${skipped > 1 ? "s" : ""} Type can't press (accents, emoji…). Use Paste for those.` });
+      await typeIntoApp(text);
       return;
     }
     const [r, text] = await Promise.all([copyItem(item.id), itemText(item.id)]);
